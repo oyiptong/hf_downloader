@@ -28,6 +28,9 @@ var (
 	outputDir string
 	force     bool // New flag
 
+	// Flag for the list command
+	listDownloaded bool
+
 	// Database connection
 	db *sql.DB
 )
@@ -194,48 +197,26 @@ the downloaded status to false.`,
 				return fmt.Errorf("failed to execute statement for URL '%s': %w", rawURL, err)
 			}
 
-			// If we reach here, the exec was successful (either insert or update)
-			rowsAffected, _ := result.RowsAffected() // Check if rows were affected (usually 1 for insert/update)
+			rowsAffected, _ := result.RowsAffected()
 
-			// In force mode, ON CONFLICT DO UPDATE might affect 1 row (the updated one).
-			// A standard INSERT affects 1 row.
-			// We need a way to know if it was an *update*.
-			// A simple way without extra queries: If force is true and rowsAffected is 1,
-			// assume it could have been an update or a new insert.
-			// A more precise way would be to query first, but ON CONFLICT is generally preferred.
-			// Let's refine the logic: If force=true, we consider it "processed" regardless of insert/update.
-			// We can try to infer if it was an update by checking if the ID already existed *before* the transaction,
-			// but that adds complexity. Let's stick to simpler logging for now.
-
-			if force && rowsAffected > 0 { // rowsAffected should be 1 for insert or update
-				// We can't easily distinguish insert vs update with ON CONFLICT without another query
-				// Let's count it as processed/updated when force is true
+			if force && rowsAffected > 0 {
 				fmt.Printf("  Added or Updated in database. Destination: %s\n", destinationPath)
-				// Let's increment a general 'processed' count in force mode for simplicity
-				processedCount++ // Or potentially updatedCount++ if we could reliably detect updates
-			} else if !force && rowsAffected > 0 { // Standard insert successful
+				processedCount++
+			} else if !force && rowsAffected > 0 {
 				fmt.Printf("  Added to database. Destination: %s\n", destinationPath)
 				processedCount++
 			} else if rowsAffected == 0 && force {
-				// This *shouldn't* typically happen with ON CONFLICT DO UPDATE unless the data was identical,
-				// but we log it just in case.
 				fmt.Printf("  Entry already exists with identical data (no changes made).\n")
-				// Treat as skipped duplicate for counting purposes in force mode? Or processed?
-				// Let's count as processed as the intent was to ensure it exists.
 				processedCount++
 			}
-			// Note: If rowsAffected is 0 in non-force mode, an error should have occurred (caught above).
-
 		}
 
-		// Commit the transaction if all operations were successful
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("failed to commit database transaction: %w", err)
 		}
 
 		fmt.Printf("\nProcessing complete.\n")
 		if force {
-			// In force mode, "processed" includes both new inserts and updates.
 			fmt.Printf("  Processed (Added or Updated): %d\n", processedCount)
 		} else {
 			fmt.Printf("  Successfully added:           %d\n", processedCount)
@@ -247,38 +228,92 @@ the downloaded status to false.`,
 	},
 }
 
+// listCmd represents the list command
+var listCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List URLs from the database",
+	Long: `Lists URLs stored in the database.
+By default, it shows URLs that have not yet been downloaded (downloaded = false).
+Use the --downloaded flag to list URLs that have been marked as downloaded.
+URLs are ordered by the date they were added in ascending order.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		var query string
+		var queryParams []interface{}
+
+		if listDownloaded {
+			fmt.Println("Listing downloaded URLs (ordered by date added):")
+			query = "SELECT url, date_added, destination_path FROM " + tableName + " WHERE downloaded = ? ORDER BY date_added ASC"
+			queryParams = append(queryParams, true)
+		} else {
+			fmt.Println("Listing not downloaded URLs (ordered by date added):")
+			query = "SELECT url, date_added, destination_path FROM " + tableName + " WHERE downloaded = ? ORDER BY date_added ASC"
+			queryParams = append(queryParams, false)
+		}
+
+		rows, err := db.Query(query, queryParams...)
+		if err != nil {
+			return fmt.Errorf("failed to query database: %w", err)
+		}
+		defer rows.Close()
+
+		found := false
+		for rows.Next() {
+			found = true
+			var itemUrl, dateAdded, destinationPath string
+			if err := rows.Scan(&itemUrl, &dateAdded, &destinationPath); err != nil {
+				log.Printf("Error scanning row: %v", err) // Log and continue if possible
+				continue
+			}
+			fmt.Printf("  URL: %s\n    Added: %s\n    Destination: %s\n", itemUrl, dateAdded, destinationPath)
+		}
+
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error iterating rows: %w", err)
+		}
+
+		if !found {
+			if listDownloaded {
+				fmt.Println("  No downloaded URLs found.")
+			} else {
+				fmt.Println("  No URLs pending download found.")
+			}
+		}
+		return nil
+	},
+}
+
 // init initializes the cobra command structure
 func init() {
 	// Add loadCmd as a subcommand to rootCmd
 	rootCmd.AddCommand(loadCmd)
+	rootCmd.AddCommand(listCmd) // Add the new listCmd
 
 	// Define flags for loadCmd
 	loadCmd.Flags().StringVarP(&inputFile, "file", "f", "", "Path to a text file containing URLs (one per line)")
 	loadCmd.Flags().StringVarP(&outputDir, "output-dir", "o", "", "Directory to store downloaded files (required)")
-	loadCmd.Flags().BoolVar(&force, "force", false, "Overwrite existing URL entry, updating date_added, destination_path, and resetting downloaded status") // Add force flag
+	loadCmd.Flags().BoolVar(&force, "force", false, "Overwrite existing URL entry, updating date_added, destination_path, and resetting downloaded status")
 
-	// Mark outputDir as required
+	// Mark outputDir as required for loadCmd
 	if err := loadCmd.MarkFlagRequired("output-dir"); err != nil {
-		log.Fatalf("Failed to mark 'output-dir' flag as required: %v", err)
+		log.Fatalf("Failed to mark 'output-dir' flag as required for load command: %v", err)
 	}
 
+	// Define flags for listCmd
+	listCmd.Flags().BoolVar(&listDownloaded, "downloaded", false, "List URLs that have been downloaded")
 }
 
 // initDB initializes the SQLite database connection and creates the table if it doesn't exist.
 func initDB(dbPath string) (*sql.DB, error) {
-	// Open the database file. It will be created if it doesn't exist.
-	d, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL") // WAL mode often better for concurrency
+	d, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("could not open database %s: %w", dbPath, err)
 	}
 
-	// Check the connection
 	if err = d.Ping(); err != nil {
-		d.Close() // Close if ping fails
+		d.Close()
 		return nil, fmt.Errorf("could not connect to database %s: %w", dbPath, err)
 	}
 
-	// SQL statement to create the table if it doesn't exist
 	createTableSQL := `
     CREATE TABLE IF NOT EXISTS ` + tableName + ` (
         "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -288,14 +323,11 @@ func initDB(dbPath string) (*sql.DB, error) {
         "destination_path" TEXT NOT NULL
     );`
 
-	// Execute the SQL statement
 	_, err = d.Exec(createTableSQL)
 	if err != nil {
-		d.Close() // Close if table creation fails
+		d.Close()
 		return nil, fmt.Errorf("could not create table '%s': %w", tableName, err)
 	}
-
-	// fmt.Printf("Database '%s' initialized successfully.\n", dbPath) // Reduce verbosity
 	return d, nil
 }
 
@@ -316,7 +348,19 @@ func parseHuggingFaceURL(rawURL string) (author string, filename string, err err
 	}
 
 	author = parts[0]
-	filename = parts[len(parts)-1]
+	filename = parts[len(parts)-1] // The last part is the filename
+
+	// If the URL is like /<author>/<modelname>/resolve/<branch>/<filename>
+	// The modelname might be parts[1] and filename parts[len(parts)-1]
+	// If the URL is just /<author>/<filename_implying_modelname>
+	// Then parts[0] is author, parts[1] is filename
+
+	// Let's refine: The filename is always the last part.
+	// The author is always the first part.
+	// The path to the model might be outputDir/author/filename (if filename implies model)
+	// OR outputDir/author/modelname/filename (if path is author/modelname/.../filename)
+	// The current destination path construction `filepath.Join(outputDir, author, filename)`
+	// seems to assume the filename is unique enough or implies the model.
 
 	if author == "" || filename == "" {
 		return "", "", fmt.Errorf("could not extract non-empty author ('%s') or filename ('%s') from path '%s'", author, filename, u.Path)
@@ -327,10 +371,7 @@ func parseHuggingFaceURL(rawURL string) (author string, filename string, err err
 
 // main is the entry point of the application
 func main() {
-	// Execute command and handle potential errors
 	if err := rootCmd.Execute(); err != nil {
-		// Cobra usually prints the error, but ensure non-zero exit code
-		// fmt.Fprintf(os.Stderr, "Error: %v\n", err) // Keep commented unless needed
 		os.Exit(1)
 	}
 }
