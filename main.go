@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mattn/go-sqlite3" // Import the driver directly to check error types
+	"github.com/rodaine/table"    // Import the new table package
 	"github.com/spf13/cobra"
 )
 
@@ -26,7 +27,7 @@ var (
 	// Flags for the load command
 	inputFile string
 	outputDir string
-	force     bool // New flag
+	force     bool
 
 	// Flag for the list command
 	listDownloaded bool
@@ -41,18 +42,15 @@ var rootCmd = &cobra.Command{
 	Short: "A CLI tool to manage Hugging Face model downloads",
 	Long: `hfdownloader helps prepare download information for models hosted on Hugging Face.
 It can parse URLs, store metadata in a database, and prepare destination paths.`,
-	// PersistentPreRunE ensures the database is initialized before any command runs
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		var err error
 		db, err = initDB(dbName)
 		if err != nil {
-			// Log initialization errors before cobra potentially suppresses them
 			log.Printf("Error initializing database: %v\n", err)
 			return fmt.Errorf("failed to initialize database: %w", err)
 		}
 		return nil
 	},
-	// PersistentPostRun closes the database connection after command execution
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		if db != nil {
 			if err := db.Close(); err != nil {
@@ -74,9 +72,8 @@ the author and filename, constructs a destination path based on the
 By default, duplicate URLs are skipped. Use the --force flag to overwrite
 existing entries, updating the date_added, destination_path, and resetting
 the downloaded status to false.`,
-	Args: cobra.ArbitraryArgs, // Allows URLs as arguments
+	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// --- Input Validation ---
 		if inputFile == "" && len(args) == 0 {
 			return fmt.Errorf("you must provide URLs either via the --file flag or as arguments")
 		}
@@ -87,17 +84,13 @@ the downloaded status to false.`,
 			return fmt.Errorf("the --output-dir flag is required")
 		}
 
-		// Clean the output directory path
 		outputDir = filepath.Clean(outputDir)
 		fmt.Printf("Using output directory: %s\n", outputDir)
 		if force {
 			fmt.Println("Force mode enabled: Existing entries will be updated.")
 		}
 
-		// --- URL Processing ---
 		var urlsToProcess []string
-
-		// Read URLs from file if specified
 		if inputFile != "" {
 			fmt.Printf("Reading URLs from file: %s\n", inputFile)
 			file, err := os.Open(inputFile)
@@ -109,7 +102,7 @@ the downloaded status to false.`,
 			scanner := bufio.NewScanner(file)
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
-				if line != "" && !strings.HasPrefix(line, "#") { // Ignore empty lines and comments
+				if line != "" && !strings.HasPrefix(line, "#") {
 					urlsToProcess = append(urlsToProcess, line)
 				}
 			}
@@ -121,23 +114,18 @@ the downloaded status to false.`,
 				return nil
 			}
 		} else {
-			// Use URLs from arguments
 			urlsToProcess = args
 			fmt.Printf("Processing %d URLs from arguments.\n", len(urlsToProcess))
 		}
 
-		// --- Database Insertion ---
 		tx, err := db.Begin()
 		if err != nil {
 			return fmt.Errorf("failed to begin database transaction: %w", err)
 		}
-		// Defer rollback, commit will override this if successful
-		defer tx.Rollback() // Use defer for cleanup
+		defer tx.Rollback()
 
-		// Prepare statement based on the force flag
 		var sqlCmd string
 		if force {
-			// If the URL exists (conflict on 'url'), update specified fields
 			sqlCmd = `
                 INSERT INTO ` + tableName + ` (url, downloaded, date_added, destination_path)
                 VALUES (?, ?, ?, ?)
@@ -147,16 +135,14 @@ the downloaded status to false.`,
                     destination_path = excluded.destination_path;
             `
 		} else {
-			// Standard insert, duplicates will cause an error handled below
 			sqlCmd = "INSERT INTO " + tableName + "(url, downloaded, date_added, destination_path) VALUES(?, ?, ?, ?)"
 		}
 
 		stmt, err := tx.Prepare(sqlCmd)
 		if err != nil {
-			// Rollback is handled by defer
 			return fmt.Errorf("failed to prepare SQL statement: %w", err)
 		}
-		defer stmt.Close() // Ensure statement is closed
+		defer stmt.Close()
 
 		processedCount := 0
 		skippedInvalidCount := 0
@@ -164,41 +150,30 @@ the downloaded status to false.`,
 
 		for _, rawURL := range urlsToProcess {
 			fmt.Printf("Processing URL: %s\n", rawURL)
-
 			author, filename, err := parseHuggingFaceURL(rawURL)
 			if err != nil {
 				fmt.Printf("  Skipping (Invalid URL/Format) - %v\n", err)
 				skippedInvalidCount++
-				continue // Skip this URL
+				continue
 			}
 
-			// Construct destination path
 			destinationPath := filepath.Join(outputDir, author, filename)
-
-			// Get current time in ISO 8601 format
 			currentTime := time.Now().Format(time.RFC3339)
 
-			// Execute the prepared statement
-			// Always set downloaded to false when adding/forcing
 			result, err := stmt.Exec(rawURL, false, currentTime, destinationPath)
 			if err != nil {
-				// Only check for constraint errors if not in force mode
 				if !force {
 					var sqliteErr sqlite3.Error
-					// Check if the error is a SQLite error and specifically a UNIQUE constraint violation
 					if errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrConstraint && sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique {
 						fmt.Printf("  Skipping (Duplicate URL)\n")
 						skippedDuplicateCount++
-						continue // Skip this URL, it already exists
+						continue
 					}
 				}
-				// If it's another error (or a constraint error in force mode, which shouldn't happen with ON CONFLICT),
-				// rollback and return the error. Rollback is handled by defer.
 				return fmt.Errorf("failed to execute statement for URL '%s': %w", rawURL, err)
 			}
 
 			rowsAffected, _ := result.RowsAffected()
-
 			if force && rowsAffected > 0 {
 				fmt.Printf("  Added or Updated in database. Destination: %s\n", destinationPath)
 				processedCount++
@@ -223,32 +198,33 @@ the downloaded status to false.`,
 			fmt.Printf("  Skipped (Duplicate):          %d\n", skippedDuplicateCount)
 		}
 		fmt.Printf("  Skipped (Invalid URL):        %d\n", skippedInvalidCount)
-
-		return nil // Success
+		return nil
 	},
 }
 
 // listCmd represents the list command
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List URLs from the database",
-	Long: `Lists URLs stored in the database.
+	Short: "List URLs from the database in a table format",
+	Long: `Lists URLs stored in the database, displaying date_added, url, and destination_path.
 By default, it shows URLs that have not yet been downloaded (downloaded = false).
 Use the --downloaded flag to list URLs that have been marked as downloaded.
 URLs are ordered by the date they were added in ascending order.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		var query string
+		var querySuffix string
 		var queryParams []interface{}
 
 		if listDownloaded {
 			fmt.Println("Listing downloaded URLs (ordered by date added):")
-			query = "SELECT url, date_added, destination_path FROM " + tableName + " WHERE downloaded = ? ORDER BY date_added ASC"
+			querySuffix = " WHERE downloaded = ? ORDER BY date_added ASC"
 			queryParams = append(queryParams, true)
 		} else {
 			fmt.Println("Listing not downloaded URLs (ordered by date added):")
-			query = "SELECT url, date_added, destination_path FROM " + tableName + " WHERE downloaded = ? ORDER BY date_added ASC"
+			querySuffix = " WHERE downloaded = ? ORDER BY date_added ASC"
 			queryParams = append(queryParams, false)
 		}
+
+		query := "SELECT date_added, url, destination_path FROM " + tableName + querySuffix
 
 		rows, err := db.Query(query, queryParams...)
 		if err != nil {
@@ -256,15 +232,28 @@ URLs are ordered by the date they were added in ascending order.`,
 		}
 		defer rows.Close()
 
+		tbl := table.New("Date Added", "URL", "Destination Path")
+		tbl.WithHeaderFormatter(func(format string, vals ...interface{}) string {
+			return strings.ToUpper(fmt.Sprintf(format, vals...))
+		})
+		tbl.WithPadding(2)              // Adjust padding as needed
+		tbl.WithHeaderSeparatorRow('-') // Use '=' as header separator
+
 		found := false
 		for rows.Next() {
 			found = true
-			var itemUrl, dateAdded, destinationPath string
-			if err := rows.Scan(&itemUrl, &dateAdded, &destinationPath); err != nil {
-				log.Printf("Error scanning row: %v", err) // Log and continue if possible
+			var dateAdded, itemUrl, destinationPath string
+			if err := rows.Scan(&dateAdded, &itemUrl, &destinationPath); err != nil {
+				log.Printf("Error scanning row: %v", err)
 				continue
 			}
-			fmt.Printf("  URL: %s\n    Added: %s\n    Destination: %s\n", itemUrl, dateAdded, destinationPath)
+			// Attempt to parse and reformat date for better readability if needed
+			parsedTime, err := time.Parse(time.RFC3339, dateAdded)
+			displayDate := dateAdded // Default to original string if parsing fails
+			if err == nil {
+				displayDate = parsedTime.Format("2006-01-02 15:04:05") // Example format
+			}
+			tbl.AddRow(displayDate, itemUrl, destinationPath)
 		}
 
 		if err := rows.Err(); err != nil {
@@ -277,6 +266,8 @@ URLs are ordered by the date they were added in ascending order.`,
 			} else {
 				fmt.Println("  No URLs pending download found.")
 			}
+		} else {
+			tbl.Print()
 		}
 		return nil
 	},
@@ -284,21 +275,16 @@ URLs are ordered by the date they were added in ascending order.`,
 
 // init initializes the cobra command structure
 func init() {
-	// Add loadCmd as a subcommand to rootCmd
 	rootCmd.AddCommand(loadCmd)
-	rootCmd.AddCommand(listCmd) // Add the new listCmd
+	rootCmd.AddCommand(listCmd)
 
-	// Define flags for loadCmd
 	loadCmd.Flags().StringVarP(&inputFile, "file", "f", "", "Path to a text file containing URLs (one per line)")
 	loadCmd.Flags().StringVarP(&outputDir, "output-dir", "o", "", "Directory to store downloaded files (required)")
 	loadCmd.Flags().BoolVar(&force, "force", false, "Overwrite existing URL entry, updating date_added, destination_path, and resetting downloaded status")
-
-	// Mark outputDir as required for loadCmd
 	if err := loadCmd.MarkFlagRequired("output-dir"); err != nil {
 		log.Fatalf("Failed to mark 'output-dir' flag as required for load command: %v", err)
 	}
 
-	// Define flags for listCmd
 	listCmd.Flags().BoolVar(&listDownloaded, "downloaded", false, "List URLs that have been downloaded")
 }
 
@@ -308,12 +294,10 @@ func initDB(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not open database %s: %w", dbPath, err)
 	}
-
 	if err = d.Ping(); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("could not connect to database %s: %w", dbPath, err)
 	}
-
 	createTableSQL := `
     CREATE TABLE IF NOT EXISTS ` + tableName + ` (
         "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -322,7 +306,6 @@ func initDB(dbPath string) (*sql.DB, error) {
         "date_added" TEXT NOT NULL,
         "destination_path" TEXT NOT NULL
     );`
-
 	_, err = d.Exec(createTableSQL)
 	if err != nil {
 		d.Close()
@@ -337,35 +320,18 @@ func parseHuggingFaceURL(rawURL string) (author string, filename string, err err
 	if err != nil {
 		return "", "", fmt.Errorf("invalid URL format: %w", err)
 	}
-
 	if u.Scheme != "https" || u.Host != huggingFaceHost {
 		return "", "", fmt.Errorf("not a valid https://huggingface.co URL")
 	}
-
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	if len(parts) < 2 {
 		return "", "", fmt.Errorf("URL path '%s' does not seem to contain author and filename", u.Path)
 	}
-
 	author = parts[0]
-	filename = parts[len(parts)-1] // The last part is the filename
-
-	// If the URL is like /<author>/<modelname>/resolve/<branch>/<filename>
-	// The modelname might be parts[1] and filename parts[len(parts)-1]
-	// If the URL is just /<author>/<filename_implying_modelname>
-	// Then parts[0] is author, parts[1] is filename
-
-	// Let's refine: The filename is always the last part.
-	// The author is always the first part.
-	// The path to the model might be outputDir/author/filename (if filename implies model)
-	// OR outputDir/author/modelname/filename (if path is author/modelname/.../filename)
-	// The current destination path construction `filepath.Join(outputDir, author, filename)`
-	// seems to assume the filename is unique enough or implies the model.
-
+	filename = parts[len(parts)-1]
 	if author == "" || filename == "" {
 		return "", "", fmt.Errorf("could not extract non-empty author ('%s') or filename ('%s') from path '%s'", author, filename, u.Path)
 	}
-
 	return author, filename, nil
 }
 
