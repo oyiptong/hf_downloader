@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io" // Added for io.MultiWriter
 	"log"
 	"net/url"
 	"os"
@@ -194,9 +195,6 @@ the downloaded status to false.`,
 				fmt.Printf("  Added to database. Destination: %s\n", destinationPath)
 				processedCount++
 			} else if rowsAffected == 0 && force {
-				// This case means the existing entry was identical to what we tried to insert/update.
-				// For ON CONFLICT DO UPDATE, if no columns actually change, RowsAffected can be 0 for some drivers/versions.
-				// For clarity, we can treat it as processed if no error occurred.
 				fmt.Printf("  Entry already exists and was targeted for update (no effective change or re-inserted).\n")
 				processedCount++
 			}
@@ -300,7 +298,7 @@ destination_path using wget with resume support (-c).
 Each download attempt is logged in the 'download_runs' table. If a download
 fails, it will be retried up to the number of times specified by --retries.
 Upon successful download, the 'downloaded' status in the 'downloads' table
-is set to true.`,
+is set to true. Wget output (progress, errors) is streamed to the console.`, // Updated long description
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Starting download process. Max retries per file: %d\n", downloadRetries)
 
@@ -345,15 +343,22 @@ is set to true.`,
 		fmt.Printf("Found %d file(s) to download.\n", len(downloadsToProcess))
 
 		for _, item := range downloadsToProcess {
-			fmt.Printf("\nProcessing Download ID %d: %s -> %s\n", item.id, item.url, item.destinationPath)
+			fmt.Printf("\nProcessing Download ID %d: %s\n", item.id, item.url)
+			fmt.Printf("  Destination: %s\n", item.destinationPath)
 
 			// Create destination directory if it doesn't exist
 			destDir := filepath.Dir(item.destinationPath)
 			if err := os.MkdirAll(destDir, os.ModePerm); err != nil {
 				log.Printf("  Failed to create destination directory '%s' for ID %d: %v. Skipping.", destDir, item.id, err)
-				// Log this attempt as a failure in download_runs?
-				// For now, we skip if dir creation fails, as wget would also fail.
-				// A more robust solution might log this specific type of failure.
+				// Log this as a failed attempt without running wget
+				startTime := time.Now()
+				_, logErr := db.Exec(
+					"INSERT INTO "+downloadRunsTable+" (download_id, attempt_number, start_time, end_time, success, details) VALUES (?, ?, ?, ?, ?, ?)",
+					item.id, 1, startTime.Format(time.RFC3339), startTime.Format(time.RFC3339), false, "Failed to create destination directory: "+err.Error(),
+				)
+				if logErr != nil {
+					log.Printf("  ERROR: Failed to log directory creation failure for ID %d: %v", item.id, logErr)
+				}
 				continue
 			}
 
@@ -362,24 +367,38 @@ is set to true.`,
 				fmt.Printf("  Attempt %d of %d...\n", attempt, downloadRetries)
 				startTime := time.Now()
 
+				// Prepare wget command
+				// -c: continue/resume
+				// -O: output to file
+				// --progress=bar:force:noscroll : try to force a cleaner progress bar if possible (optional, wget versions vary)
+				// Not all wgets support --progress=bar:force:noscroll, simple -c -O is most compatible.
+				// We will rely on wget's default progress output to stderr.
 				wgetCmd := exec.Command("wget", "-c", "-O", item.destinationPath, item.url)
-				var stderr bytes.Buffer
-				wgetCmd.Stderr = &stderr // Capture stderr for logging
 
-				err := wgetCmd.Run() // Run the command
+				// Capture stderr for logging while also displaying it live to os.Stderr
+				var stderrCapture bytes.Buffer
+				multiWriter := io.MultiWriter(os.Stderr, &stderrCapture)
+
+				wgetCmd.Stdout = os.Stdout   // Direct wget's stdout to program's stdout
+				wgetCmd.Stderr = multiWriter // Direct wget's stderr to multiWriter (os.Stderr and capture buffer)
+
+				fmt.Printf("  Running: %s\n", strings.Join(wgetCmd.Args, " ")) // Show the command being run
+
+				runErr := wgetCmd.Run() // Run the command
 
 				endTime := time.Now()
-				runSuccess := err == nil
+				runSuccess := runErr == nil
 				details := ""
 				if !runSuccess {
-					details = strings.TrimSpace(stderr.String())
-					if err != nil { // Append exec error if different from stderr message
-						if details != "" {
-							details += "\n"
-						}
-						details += "Execution error: " + err.Error()
+					// Get the captured stderr content for the details field
+					details = strings.TrimSpace(stderrCapture.String())
+					// If details is empty but runErr is not, use runErr.Error()
+					if details == "" && runErr != nil {
+						details = runErr.Error()
 					}
 				}
+				// Note: Even on success, wget might print a summary to stderr which is captured.
+				// We are only populating 'details' on failure.
 
 				// Log the attempt to download_runs
 				_, logErr := db.Exec(
@@ -388,22 +407,23 @@ is set to true.`,
 				)
 				if logErr != nil {
 					log.Printf("  ERROR: Failed to log download attempt for ID %d, attempt %d: %v", item.id, attempt, logErr)
-					// Continue with download logic despite logging failure for this attempt
 				}
 
 				if runSuccess {
-					fmt.Printf("  Download successful for ID %d.\n", item.id)
+					// Ensure a newline after wget's output if it didn't provide one
+					// This is tricky because wget's output is streamed directly.
+					// We can print our own message on a new line.
+					fmt.Printf("\n  Download successful for ID %d.\n", item.id)
 					// Update downloads table
 					_, updateErr := db.Exec("UPDATE "+downloadsTableName+" SET downloaded = ? WHERE id = ?", true, item.id)
 					if updateErr != nil {
 						log.Printf("  ERROR: Failed to mark download ID %d as downloaded: %v", item.id, updateErr)
-						// The file is downloaded, but DB update failed. This is a problematic state.
-						// For now, we log and consider the download operation for this item as concluded.
 					}
 					success = true
 					break // Exit retry loop
 				} else {
-					fmt.Printf("  Download failed for ID %d (Attempt %d/%d): %s\n", item.id, attempt, downloadRetries, details)
+					// Ensure a newline before printing failure message if wget's output didn't have one.
+					fmt.Printf("\n  Download failed for ID %d (Attempt %d/%d). Error: %s\n", item.id, attempt, downloadRetries, details)
 					if attempt < downloadRetries {
 						fmt.Println("    Retrying...")
 						time.Sleep(2 * time.Second) // Optional: wait before retrying
@@ -507,110 +527,59 @@ func parseHuggingFaceURL(rawURL string) (author string, filename string, err err
 	}
 	pathParts := strings.Split(strings.Trim(u.Path, "/"), "/")
 
-	// Handle URLs like:
-	// 1. /<repo_id>/resolve/<branch>/<filename> (e.g., /TheBloke/Llama-2-7B-AWQ/resolve/main/model.safetensors)
-	// 2. /<repo_id>/blob/<branch>/<filename> (less common for direct download links, but similar structure)
-	// 3. /<author>/<model_name>/resolve/<branch>/<filename> (if repo_id contains '/')
-	// 4. /<author>/<model_name>/raw/<filename> (older style, less common now)
-	// We generally expect at least <author>/<model_name>/.../<filename> or <repo_id>/.../<filename>
-	// The filename is usually the last part. The "author" can be the first part or first two parts if repo_id is like "Org/Model".
-
-	if len(pathParts) >= 2 {
-		// Simplistic approach: last part is filename, first part is "author" (or start of repo_id)
-		// For repo_id like "TheBloke/Llama-2-7B-AWQ", pathParts[0] is "TheBloke", pathParts[1] is "Llama-2-7B-AWQ"
-		// If the URL is /TheBloke/Llama-2-7B-AWQ/resolve/main/model.safetensors
-		// pathParts = ["TheBloke", "Llama-2-7B-AWQ", "resolve", "main", "model.safetensors"]
-		// We want author to be "TheBloke/Llama-2-7B-AWQ" and filename "model.safetensors"
-		// Or, if the user provides outputDir, maybe just "author" as the first part of the repo_id is fine for directory structure.
-		// The current code takes pathParts[0] as author.
-		// Let's refine this to better match typical HF structures for directory creation.
-		// If the path has "resolve" or "blob", the actual model path is usually before that.
-		// Example: /tiiuae/falcon-7b/resolve/main/pytorch_model.bin
-		// Author: tiiuae, Model: falcon-7b, Filename: pytorch_model.bin
-		// Stored as: outputDir/tiiuae/falcon-7b/pytorch_model.bin (if outputDir/author/model_name/filename)
-		// Or: outputDir/tiiuae--falcon-7b/pytorch_model.bin (if outputDir/repo_id_flat/filename)
-
-		// For simplicity and consistency with many downloaders, let's assume the first part of the path is the "author"
-		// or the organization, and the filename is the last part.
-		// If the repo ID has a slash (e.g. "Org/ModelName"), pathParts[0] will be "Org".
-		// The `destinationPath` in `loadCmd` is `filepath.Join(outputDir, author, filename)`.
-		// This means `author` should be the primary directory name.
-
-		author = pathParts[0]
-		filename = pathParts[len(pathParts)-1]
-
-		// Check for common intermediate path segments like "resolve", "blob", "raw"
-		// and try to get a more descriptive "model name" part if available for the author string.
-		// For example, if URL is /<org>/<model>/resolve/main/<file>, author could be <org>/<model>
-		if len(pathParts) > 2 { // e.g. org/model/resolve/... or user/model/resolve/...
-			// If pathParts[0] is an org and pathParts[1] is a model name,
-			// it might be better to use "org/model" as the "author" for directory structure.
-			// However, the original code used pathParts[0]. Let's stick to that for now
-			// but note that this might lead to flat structures like outputDir/TheBloke/model.safetensors
-			// instead of outputDir/TheBloke/Llama-2-7B-AWQ/model.safetensors if not careful.
-
-			// The current `loadCmd` uses `author = parts[0]` and `filename = parts[len(parts)-1]`.
-			// The `destinationPath` becomes `filepath.Join(outputDir, author, filename)`.
-			// This is simple. If a user wants a deeper structure, they'd need to adjust `outputDir` in `loadCmd`.
-			// Example: `load --output-dir /models/TheBloke/Llama-2-7B-AWQ ...`
-			// Then `author` (pathParts[0]) from the URL like `/TheBloke/Llama-2-7B-AWQ/...` is "TheBloke".
-			// This results in `/models/TheBloke/Llama-2-7B-AWQ/TheBloke/model.safetensors` which is not ideal.
-
-			// Let's adjust `parseHuggingFaceURL` to return a more structured author/repo part.
-			// Typically, the repo ID is the first two parts if it's an org model (e.g., "TheBloke/Llama-2-7B-GPTQ")
-			// or the first part if it's a user model (e.g., "username/modelname" where "username" is pathParts[0]).
-			// The crucial part for `destination_path` is how `author` is used.
-			// `destinationPath := filepath.Join(outputDir, author, filename)`
-			// If URL is /TheBloke/Llama-2-7B-AWQ/resolve/main/model.safetensors
-			// We want author to be "TheBloke/Llama-2-7B-AWQ" for path construction.
-
-			repoIdParts := []string{}
-			for _, p := range pathParts {
-				if p == "resolve" || p == "blob" || p == "raw" || p == "tree" { // "tree" for listing files
-					break
-				}
-				repoIdParts = append(repoIdParts, p)
-			}
-
-			if len(repoIdParts) > 0 {
-				// Use the full repo ID (e.g., "TheBloke/Llama-2-7B-AWQ") as the "author" for path construction.
-				// This will result in outputDir/TheBloke/Llama-2-7B-AWQ/filename if repoIdParts is ["TheBloke", "Llama-2-7B-AWQ"]
-				// and `filepath.Join` handles multiple elements.
-				author = filepath.Join(repoIdParts...) // This will create author/modelname as part of the path
-				filename = pathParts[len(pathParts)-1]
-			} else {
-				// Fallback or if the structure is very simple, e.g. /username/file.txt (not typical for models)
-				if len(pathParts) >= 2 {
-					author = pathParts[0]
-					filename = pathParts[len(pathParts)-1]
-				} else if len(pathParts) == 1 && !strings.Contains(pathParts[0], "/") { // e.g. /somefile.txt at root (unlikely for HF)
-					author = "_" // placeholder for author if none found
-					filename = pathParts[0]
-				} else {
-					return "", "", fmt.Errorf("URL path '%s' too short or malformed to extract repo and filename", u.Path)
-				}
-			}
-		} else if len(pathParts) == 2 { // e.g. /username/modelname (if this is a direct file link, filename is modelname)
-			author = pathParts[0]
-			filename = pathParts[1]
-		} else if len(pathParts) == 1 && !strings.Contains(pathParts[0], "/") { // Unlikely for HF files, more like a repo name
-			return "", "", fmt.Errorf("URL path '%s' seems to be a repository root, not a file link", u.Path)
-		} else {
-			return "", "", fmt.Errorf("URL path '%s' does not seem to contain enough parts for repo and filename", u.Path)
-		}
-
-		if author == "" || filename == "" {
-			return "", "", fmt.Errorf("could not extract non-empty author/repo ('%s') or filename ('%s') from path '%s'", author, filename, u.Path)
-		}
-		// Sanitize filename to prevent path traversal issues, though filepath.Join should handle it.
-		filename = filepath.Base(filename)
-		if filename == "." || filename == ".." {
-			return "", "", fmt.Errorf("extracted filename ('%s') is invalid", filename)
-		}
-
-		return author, filename, nil
+	if len(pathParts) < 1 { // Need at least one part for a filename, even if no author/repo
+		return "", "", fmt.Errorf("URL path '%s' is empty or invalid after splitting", u.Path)
 	}
-	return "", "", fmt.Errorf("URL path '%s' is empty or invalid after splitting", u.Path)
+
+	repoIdParts := []string{}
+	foundStopKeyword := false
+	for _, p := range pathParts[:len(pathParts)-1] { // Iterate up to the second to last part
+		if p == "resolve" || p == "blob" || p == "raw" || p == "tree" {
+			foundStopKeyword = true
+			break // Stop collecting parts for author/repo if a keyword is found
+		}
+		if p != "" { // Avoid empty parts if there are consecutive slashes, though Trim should handle most.
+			repoIdParts = append(repoIdParts, p)
+		}
+	}
+
+	if len(repoIdParts) > 0 {
+		author = filepath.Join(repoIdParts...)
+	} else {
+		// If no repo parts found (e.g. /filename.txt or /resolve/main/filename.txt where stop keyword is early)
+		// or if the path is just /author/filename.txt and no stop keywords.
+		// If path is like /TheBloke/Model/resolve/main/file.txt, repoIdParts = ["TheBloke", "Model"]
+		// If path is like /TheBloke/file.txt, repoIdParts = ["TheBloke"]
+		// If path is like /file.txt, repoIdParts is empty.
+		// If only one part in original path (e.g. /file.txt), pathParts[0] is file.txt, loop for repoIdParts is empty.
+		if len(pathParts) > 1 && !foundStopKeyword { // If more than one part and no stop keyword, first is author
+			author = pathParts[0]
+		} else if len(pathParts) == 1 { // URL like /myfile.txt
+			author = "_" // Default author/repo if only a filename is present at the root
+		} else {
+			// This case might occur if URL is like /resolve/main/file.txt
+			// Here, repoIdParts would be empty because "resolve" is a stop keyword.
+			// We need a placeholder for author.
+			author = "_"
+		}
+	}
+
+	filename = pathParts[len(pathParts)-1] // Last part is always the filename
+
+	if filename == "" {
+		return "", "", fmt.Errorf("could not extract a non-empty filename from path '%s'", u.Path)
+	}
+	if author == "" { // Ensure author is not empty, use placeholder if necessary
+		author = "_"
+	}
+
+	// Sanitize filename to prevent path traversal issues, though filepath.Join should handle it.
+	filename = filepath.Base(filename)
+	if filename == "." || filename == ".." {
+		return "", "", fmt.Errorf("extracted filename ('%s') is invalid", filename)
+	}
+
+	return author, filename, nil
 }
 
 // main is the entry point of the application
